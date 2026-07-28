@@ -1,0 +1,34 @@
+# LR sweep - lr=1e-4 | 基线: kl_weight=0.1, eps=0.2, temperature=1.0
+# 模型 / 数据
+model_name: "/tmp/model_cache/Qwen3-0.6B"
+data_p: "data/gsm8k"
+
+# LoRA
+lora_rank: 8
+lora_alpha: 32
+
+# 优化器
+max_lr: 1.0e-4          # <<< sweep 变量
+min_lr: 1.0e-6
+weight_decay: 1.0e-4
+max_grad_norm: 1.0
+
+# 训练 / rollout (调 LR 期间固定的基线)
+temperature: 1.0        # 固定
+max_new_tokens: 512
+eps: 0.1                # 固定 (标准 clip)
+w_format_r: 0.1
+use_ref_model: true
+kl_weight: 0.1          # 固定
+num_gen: 8              # 固定
+ppo_num_epoch: 1        # 固定
+train_prompt_size: 16
+gradient_accumulation_steps: 1
+ppo_train_mini_bs: 8
+rollout_mini_bs: 8
+val_bs: 32
+num_epoch: 2
+eval_ratio: 0.25
+
+# 输出
+save_root: "./saves/eps_sweep/eps0.1"
