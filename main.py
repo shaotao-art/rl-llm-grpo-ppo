@@ -625,7 +625,7 @@ if __name__ == '__main__':
 
                     # PPO ratio: zero out padding positions before exp, and clamp to avoid fp32 overflow
                     log_ratio = (mb_log_prob - mb_old_log_prob.detach()) * mask
-                    ratio = torch.exp(log_ratio.clamp(-20, 20))  # (mb, gen_len)
+                    ratio = torch.exp(log_ratio.clamp(-20, 20))  # (mb, gen_len) IMPORTANT, clamp when use exp, solution to model.generate() prob inf,nan error
                     sour1 = torch.clamp(ratio, 1 - eps, 1 + eps) * mb_adv.detach()
                     sour2 = ratio * mb_adv.detach()
 
