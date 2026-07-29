@@ -504,7 +504,8 @@ if __name__ == '__main__':
                 mean_gen_len = gen_len.mean().item()
                 max_gen_len = gen_len.max().item()
                 min_gen_len = gen_len.min().item()
-                gen_len_clip_frac = torch.sum(gen_len > max_new_tokens) / gen_len.shape[0]
+                # a sequence is "clipped" when it used up the whole length budget (no natural EOS stop)
+                gen_len_clip_frac = torch.sum((gen_len == max_new_tokens).float()) / gen_len.shape[0]
                 logger.add_scalar("rollout/mean_gen_len", mean_gen_len, global_step=g_step)
                 logger.add_scalar("rollout/max_gen_len", max_gen_len, global_step=g_step)
                 logger.add_scalar("rollout/min_gen_len", min_gen_len, global_step=g_step)
