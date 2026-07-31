@@ -328,6 +328,10 @@ if __name__ == '__main__':
     temperature = cfg["temperature"]
     max_new_tokens = cfg["max_new_tokens"]
     eps = cfg["eps"]
+    # asymmetric clip: lower bound uses (1 - eps_low), upper bound uses (1 + eps_high);
+    # both default to eps so symmetric configs keep working
+    eps_low = cfg.get("eps_low", eps)
+    eps_high = cfg.get("eps_high", eps)
     w_format_r = cfg["w_format_r"]
     use_ref_model = cfg["use_ref_model"]
     kl_weight = cfg["kl_weight"]
@@ -341,6 +345,13 @@ if __name__ == '__main__':
     num_epoch = cfg["num_epoch"]
     eval_ratio = cfg.get("eval_ratio", 0.0)  # eval (1/eval_ratio) times per epoch; 0 = disable mid-epoch eval
     resume_from = cfg.get("resume_from", None)  # None=fresh; "latest"; or a checkpoint dir/name to resume from
+    
+    loss_type = cfg.get("loss_type", "grpo")
+    loss_aggregate_type = cfg.get("loss_aggregate_type", "sample")
+    # token-level (Dr.GRPO style) loss: normalize by a fixed constant instead of the actual token count,
+    # which removes per-sample length bias and needs no cross-device communication. defaults to max_new_tokens.
+    token_norm_const = cfg.get("token_norm_const", max_new_tokens)
+    
 
     # set up dist env
     is_dist = int(os.environ.get('WORLD_SIZE', 1)) > 1
@@ -626,13 +637,36 @@ if __name__ == '__main__':
 
                     # PPO ratio: zero out padding positions before exp, and clamp to avoid fp32 overflow
                     log_ratio = (mb_log_prob - mb_old_log_prob.detach()) * mask
-                    ratio = torch.exp(log_ratio.clamp(-20, 20))  # (mb, gen_len) IMPORTANT, clamp when use exp, solution to model.generate() prob inf,nan error
-                    sour1 = torch.clamp(ratio, 1 - eps, 1 + eps) * mb_adv.detach()
-                    sour2 = ratio * mb_adv.detach()
+                    if loss_type == 'grpo':
+                        ratio = torch.exp(log_ratio.clamp(-20, 20))  # (mb, gen_len) IMPORTANT, clamp when use exp, solution to model.generate() prob inf,nan error
+                        sour1 = torch.clamp(ratio, 1 - eps_low, 1 + eps_high) * mb_adv.detach()
+                        sour2 = ratio * mb_adv.detach()
 
-                    pg_loss_matrix = torch.min(sour1, sour2) * mask
-                    pg_loss_samplewise = pg_loss_matrix.sum(dim=-1) / (mask.sum(dim=-1) + 1e-5)
-                    pg_loss = -pg_loss_samplewise.mean()
+                        pg_loss_matrix = torch.min(sour1, sour2) * mask
+                    elif loss_type == 'gspo':
+                        log_seq_ratio = torch.sum(log_ratio, dim=-1, keepdim=True) / (mask.sum(dim=-1, keepdim=True) + 1e-5)  # (mb, 1)
+                        seq_ratio = torch.exp(log_seq_ratio.clamp(-20, 20))  # (mb, 1)
+                        sour1 = torch.clamp(seq_ratio, 1 - eps_low, 1 + eps_high) * mb_adv.detach()  # (mb, 1)
+                        sour2 = seq_ratio * mb_adv.detach()  # (mb, 1)
+                        pg_loss_matrix = torch.min(sour1, sour2) * mask  # (mb, 1) * (mb, gen_len) -> (mb, gen_len)
+
+                    elif loss_type == 'cispo':
+                        ratio = torch.exp(log_ratio.clamp(-20, 20)) 
+                        clamped_ratio = torch.clamp(ratio, 1 - eps_low, 1 + eps_high)
+                        pg_loss_matrix = clamped_ratio.detach() * mb_adv.detach() * (mb_log_prob * mask)
+                    else:
+                        raise ValueError(f"Invalid loss_type: {loss_type}")
+                    
+                    if loss_aggregate_type == 'sample':
+                        pg_loss_samplewise = pg_loss_matrix.sum(dim=-1) / (mask.sum(dim=-1) + 1e-5)
+                        pg_loss = - pg_loss_samplewise.mean()
+                    elif loss_aggregate_type == 'token':
+                        # Dr.GRPO style: normalize by a fixed constant (default max_new_tokens) rather than the
+                        # actual token count. this gives every token equal weight, removes per-sample length bias,
+                        # and combines correctly across ranks / grad-accum with no extra communication.
+                        pg_loss = - pg_loss_matrix.sum(dim=-1).mean() / token_norm_const
+                    else:
+                        raise ValueError(f"Invalid loss_aggregate_type: {loss_aggregate_type}")
 
 
                     if use_ref_model:
@@ -712,8 +746,13 @@ if __name__ == '__main__':
                         
                             # log clip ratio
                             with torch.no_grad():
-                                is_clipped = (sour1 < sour2).to(mask.dtype)
-                                clip_frac_matrix = is_clipped * mask # (N, gen_len)
+                                if loss_type == 'cispo':
+                                    is_clipped = ratio != clamped_ratio
+                                    clip_frac_matrix = is_clipped * mask # (N, gen_len)
+                                else:
+                                    is_clipped = (sour1 < sour2).to(mask.dtype)
+                                    clip_frac_matrix = is_clipped * mask # (N, gen_len)
+                                
                                 if is_dist:
                                     clip_frac_gather = [torch.zeros_like(clip_frac_matrix) for _ in range(dist.get_world_size())]
                                     gen_mask_gather = [torch.zeros_like(mask) for _ in range(dist.get_world_size())]
