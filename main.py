@@ -327,7 +327,7 @@ if __name__ == '__main__':
     save_root = cfg["save_root"]
     temperature = cfg["temperature"]
     max_new_tokens = cfg["max_new_tokens"]
-    eps = cfg["eps"]
+    eps = cfg.get("eps", 0.2)
     # asymmetric clip: lower bound uses (1 - eps_low), upper bound uses (1 + eps_high);
     # both default to eps so symmetric configs keep working
     eps_low = cfg.get("eps_low", eps)
