@@ -1,0 +1,23 @@
+# eval config
+model_name: "/tmp/model_cache/Qwen3-0.6B"
+checkpoint_path: null          # set to a LoRA checkpoint dir to eval a trained model
+
+data_p: "data/gsm8k"
+eval_split: "test"
+
+# generation
+max_new_tokens: 512
+num_samples: 8                 # n samples per problem (must be >= max pass_k_values)
+temperatures: [0.0, 0.6, 0.95, 1.2]  # 0.0 = greedy
+top_p: 1.0
+
+# which pass@k values to compute (all must be <= num_samples)
+pass_k_values: [1, 2, 4, 8]
+
+# batching
+batch_size: 16                 # problems per dataloader batch
+gen_batch_size: 16             # generation mini-batch (reduce if OOM)
+
+max_problems: null             # null = all; set e.g. 100 for a quick sanity check
+
+output_path: "./eval_results.json"
