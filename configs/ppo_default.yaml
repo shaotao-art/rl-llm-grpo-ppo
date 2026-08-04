@@ -1,0 +1,43 @@
+# 模型 / 数据
+model_name: "/tmp/model_cache/Qwen3-0.6B"
+data_p: "data/gsm8k"
+
+# LoRA
+lora_rank: 8
+lora_alpha: 32
+
+# 优化器
+max_lr: 2.0e-5
+min_lr: 1.0e-6
+weight_decay: 1.0e-4
+max_grad_norm: 1.0
+
+# 生成 / rollout
+temperature: 0.95
+max_new_tokens: 512
+w_format_r: 0.1
+use_ref_model: true
+kl_weight: 0.1
+
+# PPO-specific
+vf_coef: 0.1          # value function loss weight
+gamma: 1.0            # discount factor (1.0 = no discounting within response)
+gae_lambda: 0.95      # GAE smoothing lambda
+entropy_coef: 0.0     # entropy bonus (0 = disabled)
+eps: 0.2              # policy clip epsilon
+value_clip_eps: 0.2   # value function clip epsilon
+normalize_adv: true   # normalize advantages over rollout batch
+
+# 训练批次
+train_prompt_size: 16
+num_gen: 4             # samples per prompt per rollout
+gradient_accumulation_steps: 1
+ppo_train_mini_bs: 8
+ppo_num_epoch: 1
+rollout_mini_bs: 8
+val_bs: 32
+num_epoch: 4
+eval_ratio: 0.1
+
+# 输出
+save_root: "./saves/ppo_test"
