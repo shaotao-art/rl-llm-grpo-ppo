@@ -267,7 +267,7 @@ def rollout_values(
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-def compute_gae(per_token_rewards, values, gamma, gae_lambda):
+def compute_gae(per_token_rewards, values, gamma, gae_lambda, gen_mask):
     """
     per_token_rewards : (N, T)  — reward at each gen position (0 except EOS + KL)
     values            : (N, T)  — V(s_0)..V(s_T)
@@ -277,7 +277,9 @@ def compute_gae(per_token_rewards, values, gamma, gae_lambda):
     N, T = per_token_rewards.shape
     adv = torch.zeros(N, T, device=per_token_rewards.device)
     last_g = torch.zeros(N, device=per_token_rewards.device)
-    values = torch.cat([values, torch.zeros(N, 1, device=values.device)], dim=1)  # (N, gen_len + 1)
+    last_idx_mask = gen_mask[:, -2:-1]
+    last_values = values[:, -2:-1] * last_idx_mask
+    values = torch.cat([values, last_values], dim=1)  # (N, gen_len + 1)
 
     for t in reversed(range(T)):
         delta = per_token_rewards[:, t] + gamma * values[:, t + 1] - values[:, t]
@@ -535,7 +537,7 @@ if __name__ == "__main__":
         eval_steps = {round(_tot * (i + 1) / n_evals) for i in range(n_evals)}
         eval_steps.add(_tot)
     else:
-        eval_steps = set()
+        eval_steps = set([len(train_dataloader)])
 
     val_dataset = PromptDataset(data_p, split="test")
     if is_dist:
@@ -654,7 +656,7 @@ if __name__ == "__main__":
                 )
                 logger.add_scalar(
                     "rollout/gen_len_clip_frac",
-                    (real_len_all == gen_len).float().mean().item(),
+                    (real_len_all == gen_len).float().mean().item(), # TODO: x x x <eos> last token == <eos> should not be counted
                     g_step,
                 )
 
@@ -685,14 +687,20 @@ if __name__ == "__main__":
                     logger.add_scalar("rollout/f_r", (f_sum / n_t).item(), g_step)
                     logger.add_scalar("rollout/c_r", (c_sum / n_t).item(), g_step)
                     
-                                # log rollout reward std as proxy for advantage spread
+                # log rollout reward std as proxy for advantage spread
+                if is_dist:
+                    scalar_reward_lst = [torch.zeros_like(scalar_reward) for _ in range(dist.get_world_size())]
+                    dist.all_gather(scalar_reward_lst, scalar_reward)
+                    scalar_reward_log = torch.cat(scalar_reward_lst)
+                else:
+                    scalar_reward_log = scalar_reward
                 if is_main_process:
                     logger.add_scalar(
-                        "rollout/reward_mean", scalar_reward.mean().item(), g_step
+                        "rollout/reward_mean", scalar_reward_log.mean().item(), g_step
                     )
                     logger.add_scalar(
                         "rollout/reward_std",
-                        scalar_reward.std(unbiased=False).item(),
+                        scalar_reward_log.std(unbiased=False).item(),
                         g_step,
                     )
 
@@ -710,9 +718,7 @@ if __name__ == "__main__":
                         generated_ids,
                         temperature,
                     )  # (N, gen_len) first -> inp_len - 1
-                    per_token_kl = (
-                        log_probs_old - ref_log_prob
-                    ) * gen_mask  # KL ≥ 0 on average
+                    per_token_kl = (log_probs_old - ref_log_prob) * gen_mask  # KL ≥ 0 on average
                     per_token_rewards = -kl_weight * per_token_kl # (N, gen_len) first -> inp_len - 1
 
                 # Add scalar reward at the last real token of each sample
@@ -736,19 +742,24 @@ if __name__ == "__main__":
             # ── GAE ───────────────────────────────────────────────────────────
             with torch.no_grad():
                 advantages, returns = compute_gae(
-                    per_token_rewards, old_values, gamma, gae_lambda
+                    per_token_rewards, old_values, gamma, gae_lambda, gen_mask
                 )
                 # (N, gen_len), (N, gen_len)
 
                 # Normalize advantages over the full rollout batch (masked positions excluded)
                 if normalize_adv:
-                    adv_vals = advantages[gen_mask.bool()]  
-                    adv_mean = adv_vals.mean()
-                    adv_std = adv_vals.std(unbiased=False)
+                    if is_dist:
+                        advantages_lst = [torch.zeros_like(advantages) for _ in range(dist.get_world_size())]
+                        gen_mask_lst = [torch.zeros_like(gen_mask) for _ in range(dist.get_world_size())]
+                        dist.all_gather(advantages_lst, advantages)
+                        dist.all_gather(gen_mask_lst, gen_mask)
+                        advantages_to_cal_mean_std = torch.cat(advantages_lst)[torch.cat(gen_mask_lst)]
+                    else:
+                        advantages_to_cal_mean_std = advantages[gen_mask]
+                    adv_mean = advantages_to_cal_mean_std.mean()
+                    adv_std = advantages_to_cal_mean_std.std(unbiased=False)
                     advantages = (advantages - adv_mean) / (adv_std + 1e-8)
-                    advantages = (
-                        advantages * gen_mask
-                    )  # (N, gen_len)
+                    advantages = advantages * gen_mask # (N, gen_len)
 
                 adv_for_train = advantages.unsqueeze(-1)  # (N, T, 1) — broadcast with mask
 
@@ -758,7 +769,7 @@ if __name__ == "__main__":
             assert total_samples % ppo_train_mini_bs == 0
             world_size = 1 if not is_dist else dist.get_world_size()
             assert (total_samples * ppo_num_epoch) % (
-                ppo_train_mini_bs * gradient_accumulation_steps * world_size
+                ppo_train_mini_bs * gradient_accumulation_steps
             ) == 0
 
             for ppo_epoch in range(ppo_num_epoch):
@@ -819,11 +830,7 @@ if __name__ == "__main__":
                     # ── Value loss (clipped MSE) ──────────────────────────────
                     tgt = mb_returns.detach()
                     val_unclipped = (mb_new_values - tgt) ** 2
-                    val_clipped = (
-                        mb_val_old
-                        + (mb_new_values - mb_val_old).clamp(
-                            -value_clip_eps, value_clip_eps
-                        )
+                    val_clipped = (mb_val_old+ (mb_new_values - mb_val_old).clamp(-value_clip_eps, value_clip_eps) # new value clip
                         - tgt
                     ) ** 2
                     val_loss_matrix = torch.max(val_unclipped, val_clipped) * mask
@@ -899,7 +906,7 @@ if __name__ == "__main__":
                                     )
 
                             # clip fraction
-                            is_clipped = (pg1 < pg2).to(mask.dtype)
+                            is_clipped = (pg1 > pg2).to(mask.dtype)
                             clip_mat = is_clipped * mask
                             if is_dist:
                                 cf_g = [
