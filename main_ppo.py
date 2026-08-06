@@ -239,7 +239,7 @@ def rollout_values(
     lm_model.eval()
     device = sequence_ids.device
     N = sequence_ids.shape[0]
-    values = torch.zeros(N, gen_len, device=device)
+    values = torch.zeros(N, gen_len + 1, device=device)
 
     for i in range(N // rollout_bs):
         s, e = i * rollout_bs, (i + 1) * rollout_bs
@@ -255,11 +255,11 @@ def rollout_values(
         )
         hidden = out.hidden_states[-1]  # (bs, inp_len + gen_len, H)
         # positions inp_len-1 .. inp_len+gen_len-1 → states s_0 .. s_T
-        vals = value_head(hidden[:, inp_len - 1: -1])  # (bs, gen_len)
+        vals = value_head(hidden[:, inp_len - 1:])  # (bs, gen_len + 1)
         values[s:e] = vals
 
     lm_model.train()
-    return values  # (N, gen_len)
+    return values  # (N, gen_len + 1)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -267,19 +267,16 @@ def rollout_values(
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-def compute_gae(per_token_rewards, values, gamma, gae_lambda, gen_mask):
+def compute_gae(per_token_rewards, values, gamma, gae_lambda):
     """
     per_token_rewards : (N, T)  — reward at each gen position (0 except EOS + KL)
-    values            : (N, T)  — V(s_0)..V(s_T)
+    values            : (N, T + 1)  input_len - 1 -> <eos>
     Returns:
         advantages (N, T),  returns (N, T)
     """
     N, T = per_token_rewards.shape
     adv = torch.zeros(N, T, device=per_token_rewards.device)
     last_g = torch.zeros(N, device=per_token_rewards.device)
-    last_idx_mask = gen_mask[:, -2:-1]
-    last_values = values[:, -2:-1] * last_idx_mask
-    values = torch.cat([values, last_values], dim=1)  # (N, gen_len + 1)
 
     for t in reversed(range(T)):
         delta = per_token_rewards[:, t] + gamma * values[:, t + 1] - values[:, t]
@@ -736,13 +733,14 @@ if __name__ == "__main__":
                     inp_len,
                     gen_len,
                     rollout_mini_bs,
-                )  # (N, gen_len) 0 -> inp_len
-                old_values = old_values * gen_mask # mask out padding
+                )  # (N, gen_len + 1)
+                tmp_value_mask = generated_ids != tokenizer.pad_token_id # (N, gen_len)
+                old_values[:, 1:] = old_values[:, 1:] * tmp_value_mask # mask out padding
 
             # ── GAE ───────────────────────────────────────────────────────────
             with torch.no_grad():
                 advantages, returns = compute_gae(
-                    per_token_rewards, old_values, gamma, gae_lambda, gen_mask
+                    per_token_rewards, old_values, gamma, gae_lambda
                 )
                 # (N, gen_len), (N, gen_len)
 
