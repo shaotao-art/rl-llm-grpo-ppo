@@ -47,6 +47,30 @@ def setup_dist():
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Distributed aggregation helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def all_gather_cat(tensor, is_dist):
+    """Gather a (…)-shaped tensor from all ranks and concat on dim 0 → (world*…,).
+    Single-process run (is_dist=False) returns the tensor unchanged."""
+    if not is_dist:
+        return tensor
+    lst = [torch.zeros_like(tensor) for _ in range(dist.get_world_size())]
+    dist.all_gather(lst, tensor)
+    return torch.cat(lst, dim=0)
+
+
+def all_reduce_sum(tensor, is_dist):
+    """Sum a scalar tensor across all ranks; result is meaningful only on rank 0.
+    Single-process run (is_dist=False) returns the tensor unchanged."""
+    if not is_dist:
+        return tensor
+    dist.reduce(tensor, dst=0, op=dist.ReduceOp.SUM)
+    return tensor
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Value head
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -127,10 +151,15 @@ def extract_ans(text):
 
 
 def cal_reward(pred: str, gt: str):
-    if "## Reasoning" not in pred or "## Answer" not in pred:
-        return 0, 0
-    extracted = extract_ans(pred.split("## Answer")[-1])
-    return 1, int(extracted.strip() == gt.strip())
+    format_r, answer_r = 0.0, 0.0
+    if "## Reasoning" in pred:
+        format_r += 0.5
+    if "## Answer" in pred:
+        format_r += 0.5
+    extracted_ans = extract_ans(pred)
+    if extracted_ans == gt:
+        answer_r = 1.0
+    return format_r, answer_r
 
 
 def make_loss_mask(x, pad_token_id):
@@ -158,7 +187,7 @@ def make_loss_mask(x, pad_token_id):
 
 def get_log_probs(logits, generated_ids, temperature):
     """logits (N,T,V), generated_ids (N,T) → log_probs (N,T)"""
-    logits = logits / temperature
+    # logits = logits / temperature
     log_probs_all = torch.log_softmax(logits, dim=-1)
     return torch.gather(log_probs_all, -1, generated_ids.unsqueeze(-1)).squeeze(-1)
 
@@ -229,14 +258,20 @@ def rollout(model_inputs, model, max_new_tokens, temperature, rollout_bs, pad_to
 
 @torch.no_grad()
 def rollout_values(
-    sequence_ids, lm_model, value_head, seq_mask, inp_len, gen_len, rollout_bs
+    sequence_ids, lm_model, value_head, seq_mask, inp_len, gen_len, rollout_bs, value_model=None
 ):
     """
     Returns old_values: (N, gen_len)
       col t   = V(s_t) for t = 0..gen_len-1  (state before generating token t)
       col T   = V(s_T) = bootstrap value after the full generated sequence
+
+    value_model : backbone used for the value head.
+        None                 → share the policy backbone (lm_model)
+        an AutoModelForCausalLM → independent value backbone (indep_value_model=True)
     """
     lm_model.eval()
+    if value_model is not None:
+        value_model.eval()
     device = sequence_ids.device
     N = sequence_ids.shape[0]
     values = torch.zeros(N, gen_len + 1, device=device)
@@ -251,14 +286,25 @@ def rollout_values(
             batch_seq,
             attention_mask=batch_mask,
             position_ids=pos_ids,
-            output_hidden_states=True,
+            output_hidden_states=(value_model is None),
         )
-        hidden = out.hidden_states[-1]  # (bs, inp_len + gen_len, H)
+        if value_model is None:
+            hidden = out.hidden_states[-1]  # (bs, inp_len + gen_len, H)
+        else:
+            v_out = value_model(
+                batch_seq,
+                attention_mask=batch_mask,
+                position_ids=pos_ids,
+                output_hidden_states=True,
+            )
+            hidden = v_out.hidden_states[-1]  # (bs, inp_len + gen_len, H)
         # positions inp_len-1 .. inp_len+gen_len-1 → states s_0 .. s_T
         vals = value_head(hidden[:, inp_len - 1:])  # (bs, gen_len + 1)
         values[s:e] = vals
 
     lm_model.train()
+    if value_model is not None:
+        value_model.train()
     return values  # (N, gen_len + 1)
 
 
@@ -283,7 +329,7 @@ def compute_gae(per_token_rewards, values, gamma, gae_lambda):
         last_g = delta + gamma * gae_lambda * last_g
         adv[:, t] = last_g
 
-    returns = adv + values[:, :T]
+    returns = adv + values[:, :T] # Q(s, a) = Adv(s, a) + V(s)
     return adv, returns
 
 
@@ -293,12 +339,16 @@ def compute_gae(per_token_rewards, values, gamma, gae_lambda):
 
 
 def forward_ppo(
-    sequence_ids, lm_model, value_head, attn_mask, inp_len, generated_ids, temperature
+    sequence_ids, lm_model, value_head, attn_mask, inp_len, generated_ids, temperature, value_model=None
 ):
     """
     Single forward pass returning:
         log_prob : (N, gen_len)
         values   : (N, gen_len)   — col gen_len is the bootstrap value
+
+    value_model : backbone used for the value head.
+        None                 → share the policy backbone (hidden states of lm_model)
+        an AutoModelForCausalLM → independent value backbone (indep_value_model=True)
     """
     pos_ids = attn_mask.long().cumsum(-1) - 1
     pos_ids.masked_fill_(attn_mask == 0, 1)
@@ -306,14 +356,26 @@ def forward_ppo(
         sequence_ids,
         attention_mask=attn_mask,
         position_ids=pos_ids,
-        output_hidden_states=True,
+        output_hidden_states=(value_model is None),
     )
     logits = out.logits
-    hidden = out.hidden_states[-1]  # (N, inp_len+gen_len, H)
-
     gen_logits = logits[:, inp_len - 1 : -1]  # (N, gen_len, V)
     log_prob = get_log_probs(gen_logits, generated_ids, temperature)  # (N, gen_len)
-    values = value_head(hidden[:, inp_len - 1 : -1])  # (N, gen_len)
+
+    if value_model is None:
+        # shared backbone: values from the same pass as the policy
+        hidden = out.hidden_states[-1]  # (N, inp_len+gen_len, H)
+        values = value_head(hidden[:, inp_len - 1 : -1])  # (N, gen_len)
+    else:
+        # independent value backbone: separate forward for values
+        v_out = value_model(
+            sequence_ids,
+            attention_mask=attn_mask,
+            position_ids=pos_ids,
+            output_hidden_states=True,
+        )
+        v_hidden = v_out.hidden_states[-1]
+        values = value_head(v_hidden[:, inp_len - 1 : -1])  # (N, gen_len)
 
     return log_prob, values
 
@@ -358,10 +420,9 @@ def evaluate(model, tokenizer, val_dataloader, max_new_tokens):
         cnt_sum += sum(r[1] for r in rewards)
         n_sum += len(a_lst)
 
-    if is_dist:
-        dist.reduce(fmt_sum, dst=0, op=dist.ReduceOp.SUM)
-        dist.reduce(cnt_sum, dst=0, op=dist.ReduceOp.SUM)
-        dist.reduce(n_sum, dst=0, op=dist.ReduceOp.SUM)
+    fmt_sum = all_reduce_sum(fmt_sum, is_dist)
+    cnt_sum = all_reduce_sum(cnt_sum, is_dist)
+    n_sum = all_reduce_sum(n_sum, is_dist)
     model.train()
     if is_main_process:
         return (fmt_sum / n_sum).item(), (cnt_sum / n_sum).item()
@@ -393,7 +454,7 @@ def resolve_resume_path(resume_from, ckp_dir):
     return os.path.join(ckp_dir, resume_from)
 
 
-def load_checkpoint(ckp_path, lora_model, value_head, opt, device):
+def load_checkpoint(ckp_path, lora_model, value_head, value_model, opt, device):
     from safetensors.torch import load_file
 
     adapter_sd = load_file(
@@ -403,6 +464,13 @@ def load_checkpoint(ckp_path, lora_model, value_head, opt, device):
     state = torch.load(os.path.join(ckp_path, "training_state.pt"), map_location=device)
     opt.load_state_dict(state["optimizer_state_dict"])
     value_head.load_state_dict(state["value_head_state_dict"])
+    if value_model is not None:
+        # independent critic is a PeftModel → restore its LoRA adapter
+        val_adapter_sd = load_file(
+            os.path.join(ckp_path, "value_adapter", "adapter_model.safetensors"),
+            device=str(device),
+        )
+        set_peft_model_state_dict(value_model, val_adapter_sd)
     for st in opt.state.values():
         for k, v in st.items():
             if isinstance(v, torch.Tensor):
@@ -455,6 +523,8 @@ if __name__ == "__main__":
     num_epoch = cfg["num_epoch"]
     eval_ratio = cfg.get("eval_ratio", 0.0)
     resume_from = cfg.get("resume_from", None)
+    # value backbone: whether the value model has an independent backbone (default True)
+    indep_value_model = cfg.get("indep_value_model", False)
 
     # ── dist ──────────────────────────────────────────────────────────────────
     is_dist = int(os.environ.get("WORLD_SIZE", 1)) > 1
@@ -475,6 +545,20 @@ if __name__ == "__main__":
     if is_main_process:
         lora_model.print_trainable_parameters()
 
+    # value backbone + value head
+    if indep_value_model:
+        # independent backbone (own parameters, separate from the policy LoRA model),
+        # also wrapped in LoRA so only its adapters are trainable
+        value_base = AutoModelForCausalLM.from_pretrained(model_name).to(
+            device, dtype=model.dtype
+        )
+        value_model = get_peft_model(value_base, peft_config)
+        if is_main_process:
+            print("[value model] trainable parameters (independent LoRA critic):")
+            value_model.print_trainable_parameters()
+    else:
+        # shared backbone: value head reads hidden states of the policy model
+        value_model = None
     value_head = ValueHead(model.config.hidden_size).to(device, dtype=model.dtype)
 
     ref_model = None
@@ -490,17 +574,24 @@ if __name__ == "__main__":
     # ── DDP ───────────────────────────────────────────────────────────────────
     ddp_model = None
     ddp_value_head = None
+    ddp_value_model = None
     if is_dist:
         ddp_model = DDP(lora_model, device_ids=[rank], output_device=rank)
         ddp_value_head = DDP(value_head, device_ids=[rank], output_device=rank)
+        if value_model is not None:
+            ddp_value_model = DDP(value_model, device_ids=[rank], output_device=rank)
         opt = optim.AdamW(
-            list(ddp_model.parameters()) + list(ddp_value_head.parameters()),
+            list(ddp_model.parameters())
+            + list(ddp_value_head.parameters())
+            + (list(ddp_value_model.parameters()) if ddp_value_model is not None else []),
             lr=max_lr,
             weight_decay=weight_decay,
         )
     else:
         opt = optim.AdamW(
-            list(lora_model.parameters()) + list(value_head.parameters()),
+            list(lora_model.parameters())
+            + list(value_head.parameters())
+            + (list(value_model.parameters()) if value_model is not None else []),
             lr=max_lr,
             weight_decay=weight_decay,
         )
@@ -576,20 +667,20 @@ if __name__ == "__main__":
         ckp_path = resolve_resume_path(resume_from, ckp_dir)
         if is_main_process:
             print(f"[resume] {ckp_path}")
-        state = load_checkpoint(ckp_path, lora_model, value_head, opt, device)
+        state = load_checkpoint(ckp_path, lora_model, value_head, value_model, opt, device)
         g_step = state["global_step"]
         micro_step = state["micro_step"]
         start_epoch = state["epoch"]
         resume_skip_batches = state["b_idx"] + 1
 
-    # if not resume_from:
-    #     val_f_r, val_c_r = evaluate(
-    #         lora_model, tokenizer, val_dataloader, max_new_tokens
-    #     )
-    #     if is_main_process:
-    #         print(f"init eval: val_f_r={val_f_r:.4f}  val_c_r={val_c_r:.4f}")
-    #         logger.add_scalar("val/f_r", val_f_r, global_step=g_step)
-    #         logger.add_scalar("val/c_r", val_c_r, global_step=g_step)
+    if not resume_from:
+        val_f_r, val_c_r = evaluate(
+            lora_model, tokenizer, val_dataloader, max_new_tokens
+        )
+        if is_main_process:
+            print(f"init eval: val_f_r={val_f_r:.4f}  val_c_r={val_c_r:.4f}")
+            logger.add_scalar("val/f_r", val_f_r, global_step=g_step)
+            logger.add_scalar("val/c_r", val_c_r, global_step=g_step)
 
     # ── Training ──────────────────────────────────────────────────────────────
     for ep in range(start_epoch, num_epoch):
@@ -618,7 +709,7 @@ if __name__ == "__main__":
             ).to(device)
             N, inp_len = model_inputs["attention_mask"].shape
 
-            # ── Rollout: generate + old log probs ─────────────────────────────
+            # Rollout: generate + old log probs 
             rollout_res = rollout(
                 model_inputs,
                 lora_model,
@@ -634,19 +725,12 @@ if __name__ == "__main__":
             seq_mask = make_loss_mask(
                 sequence_ids, tokenizer.pad_token_id
             )  # (N, inp_len + gen_len)
-            gen_mask = make_loss_mask(generated_ids, tokenizer.pad_token_id) # cover <eos> 0 -> inp_len
+            gen_mask = make_loss_mask(generated_ids, tokenizer.pad_token_id) # cover the first <eos>
             real_len = gen_mask.sum(dim=-1)  # (N,)
             gen_len = gen_mask.shape[-1]
 
             # log gen-length stats
-            if is_dist:
-                rl_g = [
-                    torch.zeros_like(real_len) for _ in range(dist.get_world_size())
-                ]
-                dist.all_gather(rl_g, real_len)
-                real_len_all = torch.cat(rl_g)
-            else:
-                real_len_all = real_len
+            real_len_all = all_gather_cat(real_len, is_dist)
             if is_main_process:
                 logger.add_scalar(
                     "rollout/mean_gen_len", real_len_all.float().mean().item(), g_step
@@ -659,7 +743,7 @@ if __name__ == "__main__":
 
             generated_text_lst = get_generated_text_lst(generated_ids, tokenizer)
 
-            # ── Compute rewards ───────────────────────────────────────────────
+            # Compute final rewards
             with torch.no_grad():
                 reward_lst_ = [
                     cal_reward(p, gt) for p, gt in zip(generated_text_lst, a_lst_expand)
@@ -676,21 +760,15 @@ if __name__ == "__main__":
                 f_sum = torch.tensor([float(sum(format_r_lst))], device=device)
                 c_sum = torch.tensor([float(sum(content_r_lst))], device=device)
                 n_t = torch.tensor([float(N)], device=device)
-                if is_dist:
-                    dist.reduce(f_sum, dst=0, op=dist.ReduceOp.SUM)
-                    dist.reduce(c_sum, dst=0, op=dist.ReduceOp.SUM)
-                    dist.reduce(n_t, dst=0, op=dist.ReduceOp.SUM)
+                f_sum = all_reduce_sum(f_sum, is_dist)
+                c_sum = all_reduce_sum(c_sum, is_dist)
+                n_t = all_reduce_sum(n_t, is_dist)
                 if is_main_process:
                     logger.add_scalar("rollout/f_r", (f_sum / n_t).item(), g_step)
                     logger.add_scalar("rollout/c_r", (c_sum / n_t).item(), g_step)
                     
                 # log rollout reward std as proxy for advantage spread
-                if is_dist:
-                    scalar_reward_lst = [torch.zeros_like(scalar_reward) for _ in range(dist.get_world_size())]
-                    dist.all_gather(scalar_reward_lst, scalar_reward)
-                    scalar_reward_log = torch.cat(scalar_reward_lst)
-                else:
-                    scalar_reward_log = scalar_reward
+                scalar_reward_log = all_gather_cat(scalar_reward, is_dist)
                 if is_main_process:
                     logger.add_scalar(
                         "rollout/reward_mean", scalar_reward_log.mean().item(), g_step
@@ -715,15 +793,24 @@ if __name__ == "__main__":
                         generated_ids,
                         temperature,
                     )  # (N, gen_len) first -> inp_len - 1
-                    per_token_kl = (log_probs_old - ref_log_prob) * gen_mask  # KL ≥ 0 on average
+                    per_token_kl = (log_probs_old - ref_log_prob) * gen_mask  # KL(p||q) = p * (log p - log q), wish kl smaller
                     per_token_rewards = -kl_weight * per_token_kl # (N, gen_len) first -> inp_len - 1
+                    per_token_kl_to_log = all_gather_cat(per_token_rewards, is_dist)
+                    all_gen_mask = all_gather_cat(gen_mask, is_dist)
+                    per_token_kl_all = per_token_kl_to_log[all_gen_mask]
+                    if is_main_process:
+                        logger.add_scalar("rollout/per_token_kl/mean", per_token_kl_all.mean().item(), g_step)
+                        logger.add_scalar("rollout/per_token_kl/std", per_token_kl_all.std(unbiased=False).item(), g_step)
+                        logger.add_scalar("rollout/per_token_kl/max", per_token_kl_all.max().item(), g_step)
+                        logger.add_scalar("rollout/per_token_kl/min", per_token_kl_all.min().item(), g_step)
 
                 # Add scalar reward at the last real token of each sample
                 last_real_idx = (gen_mask.sum(dim=-1) - 1).long().clamp(min=0)  # (N,) -> <eos>
                 per_token_rewards[torch.arange(N, device=device), last_real_idx] += scalar_reward
                 per_token_rewards = per_token_rewards * gen_mask # mask out padding
 
-            # ── Old values (no grad) ──────────────────────────────────────────
+            # Old values
+            active_value_model = ddp_value_model if is_dist else value_model
             with torch.no_grad():
                 old_values = rollout_values(
                     sequence_ids,
@@ -733,11 +820,12 @@ if __name__ == "__main__":
                     inp_len,
                     gen_len,
                     rollout_mini_bs,
+                    active_value_model,
                 )  # (N, gen_len + 1)
                 tmp_value_mask = generated_ids != tokenizer.pad_token_id # (N, gen_len)
                 old_values[:, 1:] = old_values[:, 1:] * tmp_value_mask # mask out padding
 
-            # ── GAE ───────────────────────────────────────────────────────────
+            # GAE
             with torch.no_grad():
                 advantages, returns = compute_gae(
                     per_token_rewards, old_values, gamma, gae_lambda
@@ -746,14 +834,9 @@ if __name__ == "__main__":
 
                 # Normalize advantages over the full rollout batch (masked positions excluded)
                 if normalize_adv:
-                    if is_dist:
-                        advantages_lst = [torch.zeros_like(advantages) for _ in range(dist.get_world_size())]
-                        gen_mask_lst = [torch.zeros_like(gen_mask) for _ in range(dist.get_world_size())]
-                        dist.all_gather(advantages_lst, advantages)
-                        dist.all_gather(gen_mask_lst, gen_mask)
-                        advantages_to_cal_mean_std = torch.cat(advantages_lst)[torch.cat(gen_mask_lst)]
-                    else:
-                        advantages_to_cal_mean_std = advantages[gen_mask]
+                    adv_all = all_gather_cat(advantages, is_dist)
+                    mask_all = all_gather_cat(gen_mask, is_dist)
+                    advantages_to_cal_mean_std = adv_all[mask_all]
                     adv_mean = advantages_to_cal_mean_std.mean()
                     adv_std = advantages_to_cal_mean_std.std(unbiased=False)
                     advantages = (advantages - adv_mean) / (adv_std + 1e-8)
@@ -810,6 +893,7 @@ if __name__ == "__main__":
                         inp_len,
                         mb_gen_ids,
                         temperature,
+                        active_value_model,
                     )  # (mb, gen_len), (mb, gen_len)
 
                     # ── Policy loss (clipped surrogate) ───────────────────────
@@ -826,6 +910,7 @@ if __name__ == "__main__":
                     pg_loss = -pg_loss_sample.mean()
 
                     # ── Value loss (clipped MSE) ──────────────────────────────
+                    # value head should in clip range to avoid aggressive update to explode
                     tgt = mb_returns.detach()
                     val_unclipped = (mb_new_values - tgt) ** 2
                     val_clipped = (mb_val_old+ (mb_new_values - mb_val_old).clamp(-value_clip_eps, value_clip_eps) # new value clip
@@ -857,6 +942,8 @@ if __name__ == "__main__":
                     if is_dist and is_accumulating:
                         sync_ctx.enter_context(ddp_model.no_sync())
                         sync_ctx.enter_context(ddp_value_head.no_sync())
+                        if ddp_value_model is not None:
+                            sync_ctx.enter_context(ddp_value_model.no_sync())
                     with sync_ctx:
                         (loss / gradient_accumulation_steps).backward()
 
@@ -864,9 +951,11 @@ if __name__ == "__main__":
                         all_params_for_clip = (
                             list(ddp_model.parameters())
                             + list(ddp_value_head.parameters())
+                            + (list(ddp_value_model.parameters()) if ddp_value_model is not None else [])
                             if is_dist
                             else list(lora_model.parameters())
                             + list(value_head.parameters())
+                            + (list(value_model.parameters()) if value_model is not None else [])
                         )
                         grad_norm = torch.nn.utils.clip_grad_norm_(
                             all_params_for_clip, max_grad_norm
@@ -906,22 +995,9 @@ if __name__ == "__main__":
                             # clip fraction
                             is_clipped = (pg1 > pg2).to(mask.dtype)
                             clip_mat = is_clipped * mask
-                            if is_dist:
-                                cf_g = [
-                                    torch.zeros_like(clip_mat)
-                                    for _ in range(dist.get_world_size())
-                                ]
-                                gm_g = [
-                                    torch.zeros_like(mask)
-                                    for _ in range(dist.get_world_size())
-                                ]
-                                dist.all_gather(cf_g, clip_mat)
-                                dist.all_gather(gm_g, mask)
-                                clip_frac = torch.cat(cf_g).sum() / (
-                                    torch.cat(gm_g).sum() + 1e-5
-                                )
-                            else:
-                                clip_frac = clip_mat.sum() / (mask.sum() + 1e-5)
+                            clip_mat_all = all_gather_cat(clip_mat, is_dist)
+                            mask_all = all_gather_cat(mask, is_dist)
+                            clip_frac = clip_mat_all.sum() / (mask_all.sum() + 1e-5)
                             if is_main_process:
                                 logger.add_scalar(
                                     "train/clip_frac", clip_frac.item(), g_step
@@ -930,13 +1006,7 @@ if __name__ == "__main__":
                             # entropy (for logging even when coef=0)
                             ent_mat = -mb_log_prob.detach() * mask
                             ent_sample = ent_mat.sum(dim=-1) / (mask.sum(dim=-1) + 1e-5)
-                            if is_dist:
-                                eg = [
-                                    torch.zeros_like(ent_sample)
-                                    for _ in range(dist.get_world_size())
-                                ]
-                                dist.all_gather(eg, ent_sample)
-                                ent_sample = torch.cat(eg)
+                            ent_sample = all_gather_cat(ent_sample, is_dist)
                             if is_main_process:
                                 logger.add_scalar(
                                     "train/entropy", ent_sample.mean().item(), g_step
@@ -964,6 +1034,10 @@ if __name__ == "__main__":
                 if is_main_process:
                     ckp_path = os.path.join(ckp_dir, f"step_{g_step}")
                     lora_model.save_pretrained(ckp_path)
+                    if value_model is not None:
+                        value_model.save_pretrained(
+                            os.path.join(ckp_path, "value_adapter")
+                        )
                     tokenizer.save_pretrained(ckp_path)
                     torch.save(
                         {
