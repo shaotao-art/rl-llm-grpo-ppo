@@ -18,14 +18,16 @@ import yaml
 
 # device 由分布式环境决定（见下方 setup_dist），不从配置读取
 def setup_dist():
-    is_dist = int(os.environ.get("WORLD_SIZE", 1)) > 1
+    """return is_dist, world_size, local_rank, device"""
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    is_dist = world_size > 1
     if is_dist:
         dist.init_process_group(backend="nccl")
         local_rank = int(os.environ["LOCAL_RANK"])
         torch.cuda.set_device(local_rank)
-        return local_rank, f"cuda:{local_rank}"
+        return True, world_size, local_rank, f"cuda:{local_rank}"
     else:
-        return 0, "cuda:0"
+        return False, 1, 0, "cuda:0"
 
 
 def build_prompt(tokenizer, text_lst: list[str]):
@@ -44,19 +46,43 @@ def build_prompt(tokenizer, text_lst: list[str]):
     return prompt_lst
 
 
-def repeat_lst(lst, num_gen):
+def repeat_lst(lst: list, num_gen: int):
     """repeat input prompt for num_gen [1, 1, 1, 1, 2, 2, 2, 2, ...]"""
     return [item for item in lst for _ in range(num_gen)]
 
 
-def get_generated_text_lst(generated_ids, tokenizer):
+def get_generated_text_lst(generated_ids: torch.Tensor, tokenizer):
     generated_text = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
     return generated_text
 
 
 ### ------------- Rollout ---------------- ###
 @torch.no_grad
-def rollout(model_inputs, model, max_new_tokens, temperature, rollout_bs, pad_token_id):
+def rollout(
+    model_inputs,
+    model,
+    max_new_tokens,
+    temperature,
+    rollout_bs,
+    pad_token_id,
+    return_log_probs=False,
+):
+    """
+    rollout model
+    Args:
+        model_inputs: dict of model inputs, paded batch input seq, (N, inp_len)
+        model: model to rollout
+        max_new_tokens: max new tokens to generate
+        temperature: temperature for sampling
+        rollout_bs: batch size for rollout
+        pad_token_id: pad token id
+        return_log_probs: whether to return log probs
+    Returns:
+        dict of rollout results
+        - sequence_ids: (N, inp_len + max_new_tokens)
+        - log_probs_old: (N, max_new_tokens)
+        - generated_ids: (N, max_new_tokens)
+    """
     model.eval()
     device = next(model.parameters()).device
     N, inp_len = model_inputs["attention_mask"].shape
@@ -66,6 +92,12 @@ def rollout(model_inputs, model, max_new_tokens, temperature, rollout_bs, pad_to
     all_generated_ids = torch.full(
         (N, max_new_tokens), pad_token_id, dtype=torch.long, device=device
     )
+    if return_log_probs:
+        all_log_probs_old = torch.zeros(
+            (N, max_new_tokens), dtype=torch.float, device=device
+        )
+    else:
+        all_log_probs_old = None
     assert N % rollout_bs == 0, "N must be divisible by rollout_bs"
     num_batches = N // rollout_bs
     # use mini batch to avoid oom
@@ -78,32 +110,42 @@ def rollout(model_inputs, model, max_new_tokens, temperature, rollout_bs, pad_to
         output = model.generate(
             **batch_model_inputs,
             return_dict_in_generate=True,
+            output_logits=return_log_probs,
             do_sample=True,
             max_new_tokens=max_new_tokens,
             temperature=temperature,
             top_p=1.0,
             top_k=0,
         )
-        sequence_ids = output.sequences
+        sequence_ids = output.sequences  # seq_ids: (N, inp_len + gen_len)
         generated_ids = sequence_ids[:, inp_len:]
         actual_gen_len = generated_ids.shape[1]
-
         all_sequence_ids[batch_start:batch_end, : inp_len + actual_gen_len] = (
             sequence_ids
         )
         all_generated_ids[batch_start:batch_end, :actual_gen_len] = generated_ids
+
+        if return_log_probs:
+            logits_old = output.logits
+            logits_old = torch.stack(logits_old, dim=1)  # (N, gen_len, vocab)
+            log_probs_old = get_log_probs(logits_old, generated_ids, temperature)
+            del logits_old
+            all_log_probs_old[batch_start:batch_end, :actual_gen_len] = log_probs_old
     model.train()
     return {
         "sequence_ids": all_sequence_ids,
+        "log_probs_old": all_log_probs_old,
         "generated_ids": all_generated_ids,
     }
 
 
 ### ------------- Froward ---------------- ###
 def get_log_probs(logits, generated_ids, temperature):
-    """
+    """get log probs for generated ids
+
     logits: (N, gen_len, vocab)  -- 每一步生成前的 logits
     generated_ids: (N, gen_len)  -- 实际采样出的 token id
+    temperature: temperature for sampling
     return: (N, gen_len)  -- 每个生成 token 的 log prob
     """
     # logits = logits / temperature
@@ -120,10 +162,8 @@ def forward_get_log_probs(
     sequence_ids, model, attn_mask, inp_len, generated_ids, temperature
 ):
     """whole seq forward and get log prob for gen ids"""
-    position_ids = attn_mask.long().cumsum(-1) - 1
-    position_ids.masked_fill_(attn_mask == 0, 1)
     logits = model(
-        sequence_ids, attention_mask=attn_mask, position_ids=position_ids
+        sequence_ids, attention_mask=attn_mask
     ).logits  # (N, inp_len + gen_len, vocab)
     gen_logits = logits[:, inp_len - 1 : -1]  # (N, gen_len, vocab)
     gen_log_prob = get_log_probs(gen_logits, generated_ids, temperature)
@@ -154,10 +194,6 @@ your reasoning process
         return prompt, a.split("####")[-1].strip()
 
     def __len__(self):
-        # if self.split == 'train': # debug only
-        #     return 200
-        # else:
-        #     return 100
         return len(self.data[self.split])
 
 
@@ -178,16 +214,15 @@ def extract_ans(text):
 
 
 def cal_reward(pred: str, gt: str):
-    format_r, content_r = 0, 0
-    if "## Reasoning" in pred and "## Answer" in pred:
-        format_r = 1
-    else:
-        return 0, 0
-    pred_ans = pred.split("## Answer")[-1]
-    extracted_ans = extract_ans(pred_ans)
-    if extracted_ans.strip() == gt.strip():  # only for simple case, assume int answer
-        content_r = 1
-    return format_r, content_r
+    format_r, answer_r = 0.0, 0.0
+    if "## Reasoning" in pred:
+        format_r += 0.5
+    if "## Answer" in pred:
+        format_r += 0.5
+    extracted_ans = extract_ans(pred)
+    if extracted_ans.strip() == gt.strip() and len(extracted_ans) > 0:
+        answer_r = 1.0
+    return format_r, answer_r
 
 
 @torch.no_grad
@@ -246,14 +281,20 @@ def make_loss_mask(x, pad_token_id):
     for i in range(N):
         found = False
         for j in range(l - 1, 0, -1):
-            if j == l - 1 and x[i][j] != pad_token_id:
+            if (
+                j == l - 1 and x[i][j] != pad_token_id
+            ):  # for trunction, final token is not eos
                 found = True
                 break
-            if x[i][j] == pad_token_id and x[i][j - 1] != pad_token_id:
+            if (
+                x[i][j] == pad_token_id and x[i][j - 1] != pad_token_id
+            ):  # for common final token , <eos>, make <eos> true
                 mask[i, j] = True
                 found = True
                 break
-        if not found:
+        if (
+            not found
+        ):  # only for generated_ids, model output <eos> as the first token, make the first token true
             mask[i, 0] = True
     return mask
 
@@ -334,6 +375,7 @@ if __name__ == "__main__":
     save_root = cfg["save_root"]
     temperature = cfg["temperature"]
     max_new_tokens = cfg["max_new_tokens"]
+    shuffle_rollout_samples = cfg.get("shuffle_rollout_samples", False)
     train_prompt_size = cfg[
         "train_prompt_size"
     ]  # per_device, train_len = len(train set) / (train_prompt_size * world_size)
@@ -354,8 +396,7 @@ if __name__ == "__main__":
     )  # None=fresh; "latest"; or a checkpoint dir/name to resume from
 
     # set up dist env
-    is_dist = int(os.environ.get("WORLD_SIZE", 1)) > 1
-    rank, device = setup_dist()
+    is_dist, world_size, rank, device = setup_dist()
     is_main_process = rank == 0
     if is_main_process:
         print(f"[config] loaded from {args.config}:")
@@ -363,6 +404,8 @@ if __name__ == "__main__":
 
     # load model
     tokenizer = AutoTokenizer.from_pretrained(student_model_name)
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"  # for batch infer
     student_model = AutoModelForCausalLM.from_pretrained(student_model_name)
     student_model.to(device)
 
@@ -376,10 +419,6 @@ if __name__ == "__main__":
     teacher_model = AutoModelForCausalLM.from_pretrained(teacher_model_name)
     teacher_model.to(device)
     teacher_model.requires_grad_(False)
-
-    # setting up tokenizer, assume tokenizer is the same as teacher tokenizer
-    tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "left"  # for batch infer
 
     # setup ddp model
     ddp_model = None
@@ -416,21 +455,6 @@ if __name__ == "__main__":
         print("len train dataset: ", len(train_dataset))
         print("len train dataloader: ", len(train_dataloader))
 
-    if eval_ratio > 0:
-        n_evals_per_epoch = max(1, round(1.0 / eval_ratio))
-        _total_steps = len(train_dataloader)
-        eval_steps = {
-            round(_total_steps * (i + 1) / n_evals_per_epoch)
-            for i in range(n_evals_per_epoch)
-        }
-        eval_steps.add(_total_steps)  # always include last step of epoch
-    else:
-        eval_steps = set()
-    if is_main_process and eval_steps:
-        print(
-            f"eval_steps per epoch: {sorted(eval_steps)} (total {len(train_dataloader)} steps/epoch, eval_ratio={eval_ratio})"
-        )
-
     val_dataset = PromptDataset(data_p, split="test")
     if is_dist:
         val_dist_sampler = DistributedSampler(val_dataset, rank=rank, shuffle=False)
@@ -454,12 +478,24 @@ if __name__ == "__main__":
         print("len val dataset: ", len(val_dataset))
         print("len val dataloader: ", len(val_dataloader))
 
+    if eval_ratio > 0:
+        n_evals_per_epoch = max(1, round(1.0 / eval_ratio))
+        _total_steps = len(train_dataloader)
+        eval_steps = {
+            round(_total_steps * (i + 1) / n_evals_per_epoch)
+            for i in range(n_evals_per_epoch)
+        }
+        eval_steps.add(_total_steps)  # always include last step of epoch
+    else:
+        eval_steps = set()
+    if is_main_process and eval_steps:
+        print(
+            f"eval_steps per epoch: {sorted(eval_steps)} (total {len(train_dataloader)} steps/epoch, eval_ratio={eval_ratio})"
+        )
+
     ckp_dir = os.path.join(save_root, "checkpoints")
     if is_main_process:
         os.makedirs(ckp_dir, exist_ok=True)
-
-    opt.zero_grad()
-    g_step = 0  # number of actual optimizer updates (opt.step calls)
 
     # total number of optimizer updates over the whole run, for step-wise lr decay
     total_train_steps = num_epoch * len(train_dataloader)
@@ -467,6 +503,9 @@ if __name__ == "__main__":
         print(
             f"total_train_steps (optimizer updates, for lr decay): {total_train_steps}"
         )
+
+    opt.zero_grad()
+    g_step = 0  # number of actual optimizer updates (opt.step calls)
 
     # ---- optionally resume from a checkpoint ----
     start_epoch = 0
@@ -487,17 +526,17 @@ if __name__ == "__main__":
                 f"batches, g_step={g_step}"
             )
 
-    # init eval (skip when resuming: the loaded model has already been evaluated)
-    if not resume_from:
-        if is_main_process:
-            print(f"init eval start")
-        val_f_r, val_c_r = evaluate(
-            lora_model, tokenizer, val_dataloader, max_new_tokens
-        )
-        if is_main_process:
-            print(f"init eval end, val_f_r: {val_f_r}, val_c_r: {val_c_r}\n\n\n")
-            logger.add_scalar("val/f_r", val_f_r, global_step=g_step)
-            logger.add_scalar("val/c_r", val_c_r, global_step=g_step)
+    # # init eval (skip when resuming: the loaded model has already been evaluated)
+    # if not resume_from:
+    #     if is_main_process:
+    #         print(f"init eval start")
+    #     val_f_r, val_c_r = evaluate(
+    #         lora_model, tokenizer, val_dataloader, max_new_tokens
+    #     )
+    #     if is_main_process:
+    #         print(f"init eval end, val_f_r: {val_f_r}, val_c_r: {val_c_r}\n\n\n")
+    #         logger.add_scalar("val/f_r", val_f_r, global_step=g_step)
+    #         logger.add_scalar("val/c_r", val_c_r, global_step=g_step)
 
     for ep in range(start_epoch, num_epoch):
         if is_dist:
@@ -533,9 +572,8 @@ if __name__ == "__main__":
             )
             sequence_ids = rollout_res["sequence_ids"]
             seq_mask = make_loss_mask(sequence_ids, tokenizer.pad_token_id)
-            generated_ids = rollout_res["generated_ids"]  # (N, gen_len)
-            gen_mask = (generated_ids != tokenizer.pad_token_id).to(lora_model.dtype)
-            gen_len = gen_mask.sum(dim=-1)  # (N, )
+            gen_mask = seq_mask[:, inp_len:]
+            gen_len = gen_mask.float().sum(dim=-1)  # (N, )
             # log gen_len
             if is_dist:
                 gen_len_gather_lst = [
@@ -564,19 +602,25 @@ if __name__ == "__main__":
                     "rollout/gen_len_clip_frac", gen_len_clip_frac, global_step=g_step
                 )
 
+            generated_ids = rollout_res["generated_ids"]
             generated_text_lst = get_generated_text_lst(generated_ids, tokenizer)
             total_samples = len(generated_text_lst)
-            assert total_samples % ppo_train_mini_bs == 0
-            world_size = 1 if not is_dist else dist.get_world_size()
+            assert (
+                total_samples % ppo_train_mini_bs == 0
+            ), f"total_samples: {total_samples}, ppo_train_mini_bs: {ppo_train_mini_bs}, cannot be divided"
             num_batches = total_samples // ppo_train_mini_bs
-            # shuffle batch
-            batch_indices = torch.arange(total_samples, device=device)
+            if shuffle_rollout_samples:
+                batch_indices = torch.randperm(total_samples, device=device)
+            else:
+                batch_indices = torch.arange(total_samples, device=device)
             for mb_idx in range(num_batches):
                 # step-wise lr scheduler (linear decay from max_lr to min_lr over optimizer updates)
                 progress = min(g_step / max(1, total_train_steps), 1.0)
                 cur_lr = max_lr - (max_lr - min_lr) * progress
                 for p_g in opt.param_groups:
                     p_g["lr"] = cur_lr
+                if is_main_process:
+                    logger.add_scalar("lr", cur_lr, global_step=g_step)
 
                 str_idx = mb_idx * ppo_train_mini_bs
                 end_idx = min((mb_idx + 1) * ppo_train_mini_bs, total_samples)
@@ -606,24 +650,22 @@ if __name__ == "__main__":
                     )  # (N, gen_len)
 
                 # loss mask: which generated positions are real tokens (not padding)
-                mask = make_loss_mask(mb_gen_ids, tokenizer.pad_token_id).to(
-                    lora_model.dtype
-                )
+                mask = mb_seq_mask[:, inp_len:]
                 # PPO ratio: zero out padding positions before exp, and clamp to avoid fp32 overflow
                 with torch.no_grad():
-                    adv =  - (policy_log_prob - teacher_log_prob) * mask
+                    adv = -(policy_log_prob - teacher_log_prob) * mask
                 reverse_kl = -policy_log_prob * adv.detach() * mask
                 mean_reverse_kl = reverse_kl.sum() / mask.sum().item()
-                
-                if mb_idx == num_batches - 1:
-                    mean_reverse_kl.backward()
-                else:
-                    if is_dist:
+
+                if is_dist:
+                    if mb_idx == num_batches - 1:
+                        mean_reverse_kl.backward()
+                    else:
                         with ddp_model.no_sync():
                             mean_reverse_kl.backward()
-                    else:
-                        mean_reverse_kl.backward()
-
+                else:
+                    mean_reverse_kl.backward()
+            # log kl
             if is_dist:
                 dist.all_reduce(mean_reverse_kl, op=dist.ReduceOp.SUM)
                 mean_reverse_kl = mean_reverse_kl / world_size
@@ -631,6 +673,7 @@ if __name__ == "__main__":
                 logger.add_scalar(
                     "train/mean_reverse_kl", mean_reverse_kl.item(), global_step=g_step
                 )
+            # log grad norm
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 ddp_model.parameters() if is_dist else lora_model.parameters(),
                 max_grad_norm,
@@ -639,7 +682,7 @@ if __name__ == "__main__":
                 logger.add_scalar(
                     "train/grad_norm", grad_norm.item(), global_step=g_step
                 )
-                logger.add_scalar("lr", cur_lr, global_step=g_step)
+
             # safety net: never let a non-finite grad poison the weights (would crash rollout sampling)
             if not torch.isfinite(grad_norm):
                 if is_main_process:
