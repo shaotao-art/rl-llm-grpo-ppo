@@ -1,0 +1,28 @@
+# 模型 / 数据
+student_model_name: "/tmp/model_cache/Qwen3-0.6B"
+teacher_model_name: "/tmp/model_cache/Qwen3-1.7B"
+data_p: "data/gsm8k"
+
+# LoRA
+lora_rank: 8
+lora_alpha: 32
+
+# 优化器
+max_lr: 2.0e-5
+min_lr: 1.0e-6
+weight_decay: 0.0
+max_grad_norm: 1.0
+
+# 训练 / rollout
+temperature: 1.0
+max_new_tokens: 512
+num_gen: 1
+train_prompt_size: 16
+ppo_train_mini_bs: 16
+rollout_mini_bs: 16
+val_bs: 32
+num_epoch: 8
+eval_ratio: 0.25
+
+# 输出
+save_root: "./saves/check/opd_default"
