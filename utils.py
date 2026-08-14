@@ -4,6 +4,7 @@ import torch
 import torch.distributed as dist
 from peft import set_peft_model_state_dict
 from tqdm import tqdm
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from core import build_prompt, get_generated_text_lst
 from gsm_8k_dataset import cal_reward
@@ -117,6 +118,67 @@ def evaluate(model, tokenizer, val_dataloader, max_new_tokens, is_dist, is_main_
     else:
         return None, None
 
-def rank_zero_print(is_main_process, *args):
-    if is_main_process:
+def rank_zero_print(*args):
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    is_dist = world_size > 1
+    if is_dist:
+        local_rank = int(os.environ["LOCAL_RANK"])
+        is_main_process = local_rank == 0
+        if is_main_process:
+            print(*args)
+    else:
         print(*args)
+
+
+def load_model_tokenier(model_name, device):
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"  # for batch infer
+    model = AutoModelForCausalLM.from_pretrained(model_name)
+    model.to(device)
+    return model, tokenizer  
+
+
+def get_eval_steps(eval_ratio, len_dataloader):
+    if eval_ratio > 0:
+        n_evals_per_epoch = max(1, round(1.0 / eval_ratio))
+        _total_steps = len_dataloader
+        eval_steps = {
+            round(_total_steps * (i + 1) / n_evals_per_epoch)
+            for i in range(n_evals_per_epoch)
+        }
+        eval_steps.add(_total_steps)  # always include last step of epoch
+    else:
+        eval_steps = set()
+    if eval_steps:
+        rank_zero_print(
+            f"eval_steps per epoch: {sorted(eval_steps)} (total {len_dataloader} steps/epoch, eval_ratio={eval_ratio})"
+        )
+    return eval_steps
+
+def resume_from_ckp(resume_from, ckp_dir, model, opt, device):
+    start_epoch = 0
+    resume_skip_batches = 0  # number of batches to skip at the start of start_epoch
+    if resume_from:
+        ckp_path = resolve_resume_path(resume_from, ckp_dir)
+        rank_zero_print(f"[resume] loading checkpoint from {ckp_path}")
+        state = load_checkpoint(ckp_path, model, opt, device)
+        g_step = state["global_step"]
+        start_epoch = state["epoch"]
+        resume_skip_batches = (
+            state["b_idx"] + 1
+        )  # continue at the batch after the saved one
+        rank_zero_print(
+                f"[resume] start_epoch={start_epoch}, skip first {resume_skip_batches} "
+                f"batches, g_step={g_step}"
+            )
+    return start_epoch, g_step, resume_skip_batches
+
+
+
+if __name__ == "__main__":
+    a = "world"
+    rank_zero_print("hello", a)
+    
+    steps = get_eval_steps(0.1, 98)
+    print(steps)

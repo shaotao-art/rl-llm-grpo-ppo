@@ -10,7 +10,14 @@ import torch.distributed as dist
 import argparse
 import yaml
 
-from utils import setup_dist, resolve_resume_path, load_checkpoint, evaluate
+from utils import (
+    setup_dist,
+    evaluate,
+    rank_zero_print,
+    load_model_tokenier,
+    resume_from_ckp,
+    get_eval_steps,
+)
 from gsm_8k_dataset import get_train_dataloader, get_val_dataloader
 from core import (
     build_prompt,
@@ -20,13 +27,6 @@ from core import (
     get_generated_text_lst,
     forward_get_log_probs,
 )
-
-
-# device 由分布式环境决定（见下方 setup_dist），不从配置读取
-
-
-
-
 
 if __name__ == "__main__":
     # ------------- Config ---------------- #
@@ -55,7 +55,8 @@ if __name__ == "__main__":
     shuffle_rollout_samples = cfg.get("shuffle_rollout_samples", False)
     train_prompt_size = cfg[
         "train_prompt_size"
-    ]  # per_device, train_len = len(train set) / (train_prompt_size * world_size)
+        # per_device, train_len = len(train set) / (train_prompt_size * world_size)
+    ]
     num_gen = 1  # 1 for opd
     ppo_train_mini_bs = cfg[
         "ppo_train_mini_bs"
@@ -63,7 +64,8 @@ if __name__ == "__main__":
     rollout_mini_bs = cfg["rollout_mini_bs"]  # bs during rollout to avoid oom
     val_bs = cfg[
         "val_bs"
-    ]  # per device eval batch size -> val_len = len(val set) / (val_bs * world_size)
+        # per device eval batch size -> val_len = len(val set) / (val_bs * world_size)
+    ]
     num_epoch = cfg["num_epoch"]
     eval_ratio = cfg.get(
         "eval_ratio", 0.0
@@ -75,16 +77,14 @@ if __name__ == "__main__":
     # set up dist env
     is_dist, world_size, rank, device = setup_dist()
     is_main_process = rank == 0
-    if is_main_process:
-        print(f"[config] loaded from {args.config}:")
-        print(yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True))
+    rank_zero_print(f"[config] loaded from {args.config}:")
+    rank_zero_print(yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True))
 
     # load model
-    tokenizer = AutoTokenizer.from_pretrained(student_model_name)
-    tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "left"  # for batch infer
-    student_model = AutoModelForCausalLM.from_pretrained(student_model_name)
-    student_model.to(device)
+
+    tokenizer, student_model = load_model_tokenier(student_model_name)
+    _, teacher_model = load_model_tokenier(teacher_model_name)
+    teacher_model.requires_grad_(False)
 
     # get lora model
     peft_config = LoraConfig(r=lora_rank, lora_alpha=lora_alpha, task_type="CAUSAL_LM")
@@ -92,18 +92,11 @@ if __name__ == "__main__":
     if is_main_process:
         lora_model.print_trainable_parameters()
 
-    # load teacher model
-    teacher_model = AutoModelForCausalLM.from_pretrained(teacher_model_name)
-    teacher_model.to(device)
-    teacher_model.requires_grad_(False)
-
     # setup ddp model
-    ddp_model = None
+    opt_model = lora_model
     if is_dist:
-        ddp_model = DDP(lora_model, device_ids=[rank], output_device=rank)
-        opt = optim.AdamW(ddp_model.parameters(), lr=max_lr, weight_decay=weight_decay)
-    else:
-        opt = optim.AdamW(lora_model.parameters(), lr=max_lr, weight_decay=weight_decay)
+        opt_model = DDP(lora_model, device_ids=[rank], output_device=rank)
+    opt = optim.AdamW(opt_model.parameters(), lr=max_lr, weight_decay=weight_decay)
 
     # get tensorboard logger
     if is_main_process:
@@ -115,20 +108,8 @@ if __name__ == "__main__":
     )
     val_dataloader = get_val_dataloader(data_p, val_bs, is_dist, rank, is_main_process)
 
-    if eval_ratio > 0:
-        n_evals_per_epoch = max(1, round(1.0 / eval_ratio))
-        _total_steps = len(train_dataloader)
-        eval_steps = {
-            round(_total_steps * (i + 1) / n_evals_per_epoch)
-            for i in range(n_evals_per_epoch)
-        }
-        eval_steps.add(_total_steps)  # always include last step of epoch
-    else:
-        eval_steps = set()
-    if is_main_process and eval_steps:
-        print(
-            f"eval_steps per epoch: {sorted(eval_steps)} (total {len(train_dataloader)} steps/epoch, eval_ratio={eval_ratio})"
-        )
+    # get eval steps
+    eval_steps = get_eval_steps(eval_ratio, len(train_dataloader))
 
     ckp_dir = os.path.join(save_root, "checkpoints")
     if is_main_process:
@@ -136,50 +117,34 @@ if __name__ == "__main__":
 
     # total number of optimizer updates over the whole run, for step-wise lr decay
     total_train_steps = num_epoch * len(train_dataloader)
-    if is_main_process:
-        print(
-            f"total_train_steps (optimizer updates, for lr decay): {total_train_steps}"
+    rank_zero_print(
+        f"total_train_steps (optimizer updates, for lr decay): {total_train_steps}"
+    )
+
+
+    # optionally resume from a checkpoint
+    g_step = 0
+    start_epoch, g_step, resume_skip_batches = resume_from_ckp(
+        resume_from, ckp_dir, opt_model, opt, device
+    )
+
+    # init eval (skip when resuming: the loaded model has already been evaluated)
+    if not resume_from:
+        rank_zero_print(f"init eval start")
+        val_f_r, val_c_r = evaluate(
+            lora_model,
+            tokenizer,
+            val_dataloader,
+            max_new_tokens,
+            is_dist,
+            is_main_process,
         )
+        rank_zero_print(f"init eval end, val_f_r: {val_f_r}, val_c_r: {val_c_r}\n\n\n")
+        if is_main_process:
+            logger.add_scalar("val/f_r", val_f_r, global_step=g_step)
+            logger.add_scalar("val/c_r", val_c_r, global_step=g_step)
 
     opt.zero_grad()
-    g_step = 0  # number of actual optimizer updates (opt.step calls)
-
-    # ---- optionally resume from a checkpoint ----
-    start_epoch = 0
-    resume_skip_batches = 0  # number of batches to skip at the start of start_epoch
-    if resume_from:
-        ckp_path = resolve_resume_path(resume_from, ckp_dir)
-        if is_main_process:
-            print(f"[resume] loading checkpoint from {ckp_path}")
-        state = load_checkpoint(ckp_path, lora_model, opt, device)
-        g_step = state["global_step"]
-        start_epoch = state["epoch"]
-        resume_skip_batches = (
-            state["b_idx"] + 1
-        )  # continue at the batch after the saved one
-        if is_main_process:
-            print(
-                f"[resume] start_epoch={start_epoch}, skip first {resume_skip_batches} "
-                f"batches, g_step={g_step}"
-            )
-
-    # # init eval (skip when resuming: the loaded model has already been evaluated)
-    # if not resume_from:
-    #     if is_main_process:
-    #         print(f"init eval start")
-    #     val_f_r, val_c_r = evaluate(
-    #         lora_model,
-    #         tokenizer,
-    #         val_dataloader,
-    #         max_new_tokens,
-    #         is_dist,
-    #         is_main_process,
-    #     )
-    #     if is_main_process:
-    #         print(f"init eval end, val_f_r: {val_f_r}, val_c_r: {val_c_r}\n\n\n")
-    #         logger.add_scalar("val/f_r", val_f_r, global_step=g_step)
-    #         logger.add_scalar("val/c_r", val_c_r, global_step=g_step)
-
     for ep in range(start_epoch, num_epoch):
         if is_dist:
             train_dataloader.sampler.set_epoch(ep)
@@ -274,7 +239,7 @@ if __name__ == "__main__":
                 # cur policy log prob
                 policy_log_prob = forward_get_log_probs(
                     mb_seq_ids,
-                    ddp_model if is_dist else lora_model,
+                    opt_model,
                     mb_seq_mask,
                     inp_len,
                     mb_gen_ids,
@@ -303,7 +268,7 @@ if __name__ == "__main__":
                     if mb_idx == num_batches - 1:
                         mean_reverse_kl.backward()
                     else:
-                        with ddp_model.no_sync():
+                        with opt_model.no_sync():
                             mean_reverse_kl.backward()
                 else:
                     mean_reverse_kl.backward()
@@ -317,7 +282,7 @@ if __name__ == "__main__":
                 )
             # log grad norm
             grad_norm = torch.nn.utils.clip_grad_norm_(
-                ddp_model.parameters() if is_dist else lora_model.parameters(),
+                opt_model.parameters() if is_dist else lora_model.parameters(),
                 max_grad_norm,
             )
             if is_main_process:
@@ -327,8 +292,7 @@ if __name__ == "__main__":
 
             # safety net: never let a non-finite grad poison the weights (would crash rollout sampling)
             if not torch.isfinite(grad_norm):
-                if is_main_process:
-                    print(
+                rank_zero_print(
                         f"[warn] non-finite grad_norm at g_step {g_step}, skipping optimizer step"
                     )
                 opt.zero_grad(set_to_none=True)
@@ -349,7 +313,7 @@ if __name__ == "__main__":
                 )
                 if is_main_process:
                     frac = (b_idx + 1) / len(train_dataloader)
-                    print(
+                    rank_zero_print(
                         f"eval ep {ep} step {b_idx+1}/{len(train_dataloader)} ({frac:.0%}): val_f_r={val_f_r:.4f}, val_c_r={val_c_r:.4f}"
                     )
                     logger.add_scalar("val/f_r", val_f_r, global_step=g_step)
@@ -372,4 +336,4 @@ if __name__ == "__main__":
                         },
                         os.path.join(ckp_path, "training_state.pt"),
                     )
-                    print(f"Checkpoint saved to {ckp_path}")
+                    rank_zero_print(f"Checkpoint saved to {ckp_path}")
