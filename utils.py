@@ -1,13 +1,27 @@
+import argparse
 import os
 
 import torch
 import torch.distributed as dist
-from peft import set_peft_model_state_dict
+import yaml
+from peft import LoraConfig, get_peft_model, set_peft_model_state_dict
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from core import build_prompt, get_generated_text_lst
 from gsm_8k_dataset import cal_reward
+
+
+def load_config(default_config="configs/default.yaml"):
+    """Parse --config from cli, load the yaml and echo it (rank 0 only)."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, default=default_config)
+    args = parser.parse_args()
+    with open(args.config) as f:
+        cfg = yaml.safe_load(f)
+    rank_zero_print(f"[config] loaded from {args.config}:")
+    rank_zero_print(yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True))
+    return cfg
 
 
 def resolve_resume_path(resume_from, ckp_dir):
@@ -69,8 +83,36 @@ def setup_dist():
         return False, 1, 0, "cuda:0"
 
 
+def all_gather_cat(tensor, is_dist):
+    """Gather a (…)-shaped tensor from all ranks and concat on dim 0 → (world*…,).
+    Single-process run (is_dist=False) returns the tensor unchanged."""
+    if not is_dist:
+        return tensor
+    lst = [torch.zeros_like(tensor) for _ in range(dist.get_world_size())]
+    dist.all_gather(lst, tensor)
+    return torch.cat(lst, dim=0)
+
+
+def all_reduce_sum(tensor, is_dist):
+    """Sum a scalar tensor across all ranks; result is meaningful only on rank 0.
+    Single-process run (is_dist=False) returns the tensor unchanged."""
+    if not is_dist:
+        return tensor
+    dist.reduce(tensor, dst=0, op=dist.ReduceOp.SUM)
+    return tensor
+
+
 @torch.no_grad
-def evaluate(model, tokenizer, val_dataloader, max_new_tokens, is_dist, is_main_process):
+def evaluate(
+    model,
+    tokenizer,
+    val_dataloader,
+    max_new_tokens,
+    is_dist,
+    is_main_process,
+    cal_reward_fn=None,
+):
+    reward_fn = cal_reward_fn if cal_reward_fn is not None else cal_reward
     model.eval()
     device = next(model.parameters()).device
     format_r_sum = torch.tensor([0], device=device, dtype=torch.float)
@@ -99,17 +141,16 @@ def evaluate(model, tokenizer, val_dataloader, max_new_tokens, is_dist, is_main_
                 print("-" * 50)
 
         reward_lst_ = [
-            cal_reward(gen_pred, gt) for gen_pred, gt in zip(generated_text_lst, a_lst)
+            reward_fn(gen_pred, gt) for gen_pred, gt in zip(generated_text_lst, a_lst)
         ]
         format_r_lst = [x[0] for x in reward_lst_]
         content_r_lst = [x[1] for x in reward_lst_]
         format_r_sum += sum(format_r_lst)
         content_r_sum += sum(content_r_lst)
         num_sample_sum += len(a_lst)
-    if is_dist:
-        dist.reduce(format_r_sum, dst=0, op=dist.ReduceOp.SUM)
-        dist.reduce(content_r_sum, dst=0, op=dist.ReduceOp.SUM)
-        dist.reduce(num_sample_sum, dst=0, op=dist.ReduceOp.SUM)
+    format_r_sum = all_reduce_sum(format_r_sum, is_dist)
+    content_r_sum = all_reduce_sum(content_r_sum, is_dist)
+    num_sample_sum = all_reduce_sum(num_sample_sum, is_dist)
     model.train()
     if is_main_process:
         mean_f_r = format_r_sum / num_sample_sum
@@ -117,6 +158,7 @@ def evaluate(model, tokenizer, val_dataloader, max_new_tokens, is_dist, is_main_
         return mean_f_r.item(), mean_c_r.item()
     else:
         return None, None
+
 
 def rank_zero_print(*args):
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -130,13 +172,99 @@ def rank_zero_print(*args):
         print(*args)
 
 
-def load_model_tokenier(model_name, device):
+def load_model_tokenier(model_name, device=None):
+    """Load tokenizer + model. device defaults to the current cuda device
+    (setup_dist has already called torch.cuda.set_device by the time this runs).
+    Returns (tokenizer, model)."""
+    if device is None:
+        device = (
+            f"cuda:{torch.cuda.current_device()}"
+            if torch.cuda.is_available()
+            else "cpu"
+        )
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"  # for batch infer
     model = AutoModelForCausalLM.from_pretrained(model_name)
     model.to(device)
-    return model, tokenizer  
+    return tokenizer, model
+
+
+def build_lora_model(model, lora_rank, lora_alpha, is_main_process=True):
+    """Wrap a base model with LoRA adapters and print trainable params on rank 0."""
+    peft_config = LoraConfig(r=lora_rank, lora_alpha=lora_alpha, task_type="CAUSAL_LM")
+    lora_model = get_peft_model(model, peft_config)
+    if is_main_process:
+        lora_model.print_trainable_parameters()
+    return lora_model
+
+
+def update_lr(opt, g_step, total_train_steps, max_lr, min_lr):
+    """Step-wise linear decay from max_lr to min_lr over optimizer updates.
+    Returns the current lr."""
+    progress = min(g_step / max(1, total_train_steps), 1.0)
+    cur_lr = max_lr - (max_lr - min_lr) * progress
+    for p_g in opt.param_groups:
+        p_g["lr"] = cur_lr
+    return cur_lr
+
+
+def log_gen_len_stats(
+    logger, gen_len, max_new_tokens, g_step, is_dist, is_main_process
+):
+    """All-gather per-sample generated lengths across ranks and log stats to tensorboard."""
+    gen_len = all_gather_cat(
+        gen_len, is_dist
+    ).float()  # cast: some callers pass int64 lengths
+    if is_main_process:
+        mean_gen_len = gen_len.mean().item()
+        max_gen_len = gen_len.max().item()
+        min_gen_len = gen_len.min().item()
+        # a sequence is "clipped" when it used up the whole length budget (no natural EOS stop)
+        gen_len_clip_frac = (
+            torch.sum((gen_len == max_new_tokens).float()) / gen_len.shape[0]
+        )
+        logger.add_scalar("rollout/mean_gen_len", mean_gen_len, global_step=g_step)
+        logger.add_scalar("rollout/max_gen_len", max_gen_len, global_step=g_step)
+        logger.add_scalar("rollout/min_gen_len", min_gen_len, global_step=g_step)
+        logger.add_scalar(
+            "rollout/gen_len_clip_frac", gen_len_clip_frac, global_step=g_step
+        )
+
+
+def save_checkpoint(
+    ckp_dir,
+    lora_model,
+    tokenizer,
+    opt,
+    ep,
+    b_idx,
+    g_step,
+    is_dist,
+    is_main_process,
+    extra_state=None,
+):
+    """Save LoRA adapter + tokenizer + training state under ckp_dir/step_<g_step>.
+    extra_state: optional dict merged into training_state.pt (e.g. {"micro_step": ...}).
+    Returns ckp_path on the main process, None elsewhere."""
+    if is_dist:
+        dist.barrier()
+    if is_main_process:
+        ckp_path = os.path.join(ckp_dir, f"step_{g_step}")
+        lora_model.save_pretrained(ckp_path)
+        tokenizer.save_pretrained(ckp_path)
+        state = {
+            "epoch": ep,
+            "b_idx": b_idx,
+            "global_step": g_step,
+            "optimizer_state_dict": opt.state_dict(),
+        }
+        if extra_state:
+            state.update(extra_state)
+        torch.save(state, os.path.join(ckp_path, "training_state.pt"))
+        rank_zero_print(f"Checkpoint saved to {ckp_path}")
+        return ckp_path
+    return None
 
 
 def get_eval_steps(eval_ratio, len_dataloader):
@@ -156,29 +284,39 @@ def get_eval_steps(eval_ratio, len_dataloader):
         )
     return eval_steps
 
-def resume_from_ckp(resume_from, ckp_dir, model, opt, device):
+
+def resume_from_ckp(resume_from, ckp_dir, model, opt, device, load_fn=None):
+    """Optionally resume from a checkpoint.
+
+    load_fn: custom loader with the same signature as load_checkpoint (e.g. ppo's
+        value-aware loader, partially bound with value_head/value_model).
+    Returns (start_epoch, g_step, resume_skip_batches, state); state is None when
+    not resuming — callers can pull extra counters from it, e.g. state["micro_step"].
+    """
     start_epoch = 0
+    g_step = 0
     resume_skip_batches = 0  # number of batches to skip at the start of start_epoch
+    state = None
     if resume_from:
+        loader = load_fn or load_checkpoint
         ckp_path = resolve_resume_path(resume_from, ckp_dir)
         rank_zero_print(f"[resume] loading checkpoint from {ckp_path}")
-        state = load_checkpoint(ckp_path, model, opt, device)
+        state = loader(ckp_path, model, opt, device)
         g_step = state["global_step"]
         start_epoch = state["epoch"]
         resume_skip_batches = (
             state["b_idx"] + 1
         )  # continue at the batch after the saved one
         rank_zero_print(
-                f"[resume] start_epoch={start_epoch}, skip first {resume_skip_batches} "
-                f"batches, g_step={g_step}"
-            )
-    return start_epoch, g_step, resume_skip_batches
-
+            f"[resume] start_epoch={start_epoch}, skip first {resume_skip_batches} "
+            f"batches, g_step={g_step}"
+        )
+    return start_epoch, g_step, resume_skip_batches, state
 
 
 if __name__ == "__main__":
     a = "world"
     rank_zero_print("hello", a)
-    
+
     steps = get_eval_steps(0.1, 98)
     print(steps)

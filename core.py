@@ -98,7 +98,7 @@ def rollout(
         if return_log_probs:
             logits_old = output.logits
             logits_old = torch.stack(logits_old, dim=1)  # (N, gen_len, vocab)
-            log_probs_old = get_log_probs(logits_old, generated_ids, temperature)
+            log_probs_old = get_log_probs(logits_old, generated_ids)
             del logits_old
             all_log_probs_old[batch_start:batch_end, :actual_gen_len] = log_probs_old
     model.train()
@@ -109,15 +109,13 @@ def rollout(
     }
 
 
-def get_log_probs(logits, generated_ids, temperature):
+def get_log_probs(logits, generated_ids):
     """get log probs for generated ids
 
     logits: (N, gen_len, vocab)  -- 每一步生成前的 logits
     generated_ids: (N, gen_len)  -- 实际采样出的 token id
-    temperature: temperature for sampling
     return: (N, gen_len)  -- 每个生成 token 的 log prob
     """
-    # logits = logits / temperature
     log_probs_all = torch.log_softmax(logits, dim=-1)  # (N, gen_len, vocab)
     log_probs = torch.gather(
         log_probs_all, dim=-1, index=generated_ids.unsqueeze(-1)  # (N, gen_len, 1)
@@ -127,46 +125,45 @@ def get_log_probs(logits, generated_ids, temperature):
     return log_probs
 
 
-def forward_get_log_probs(
-    sequence_ids, model, attn_mask, inp_len, generated_ids, temperature
-):
+def left_pad_position_ids(attn_mask):
+    """position_ids for a left-padded batch: real tokens get 0..len-1, pads get 1."""
+    position_ids = attn_mask.long().cumsum(-1) - 1
+    position_ids.masked_fill_(attn_mask == 0, 1)
+    return position_ids
+
+
+def forward_get_log_probs(sequence_ids, model, attn_mask, inp_len, generated_ids):
     """whole seq forward and get log prob for gen ids"""
     logits = model(
-        sequence_ids, attention_mask=attn_mask
+        sequence_ids,
+        attention_mask=attn_mask,
+        position_ids=left_pad_position_ids(attn_mask),
     ).logits  # (N, inp_len + gen_len, vocab)
     gen_logits = logits[:, inp_len - 1 : -1]  # (N, gen_len, vocab)
-    gen_log_prob = get_log_probs(gen_logits, generated_ids, temperature)
+    gen_log_prob = get_log_probs(gen_logits, generated_ids)
     return gen_log_prob
 
 
-
-
-
 def make_loss_mask(x, pad_token_id):
-    N, l = x.shape
+    """(N, l) token ids -> (N, l) bool mask.
+
+    Real tokens are True; padding is False, EXCEPT that the first pad token after
+    the real content is kept True — since pad_token == eos_token, that position is
+    the natural <eos> and must contribute to the loss. Truncated rows (no trailing
+    pad) are left untouched; all-pad rows get only their first token set.
+    """
     mask = x != pad_token_id
-    for i in range(N):
-        found = False
-        for j in range(l - 1, 0, -1):
-            if (
-                j == l - 1 and x[i][j] != pad_token_id
-            ):  # for trunction, final token is not eos
-                found = True
-                break
-            if (
-                x[i][j] == pad_token_id and x[i][j - 1] != pad_token_id
-            ):  # for common final token , <eos>, make <eos> true
-                mask[i, j] = True
-                found = True
-                break
-        if (
-            not found
-        ):  # only for generated_ids, model output <eos> as the first token, make the first token true
-            mask[i, 0] = True
+    if x.shape[1] == 1:  # degenerate length: original loop marks the only token
+        return torch.ones_like(mask)
+    # transition: pad at j following a real token at j-1
+    trans = (x[:, 1:] == pad_token_id) & mask[:, :-1]  # (N, l-1), index j-1
+    has_trans = trans.any(dim=1)
+    last_is_pad = x[:, -1] == pad_token_id
+    # largest such j (loop in the original impl scanned from the end)
+    last_trans = trans.shape[1] - 1 - trans.flip(dims=[1]).float().argmax(dim=1)
+    rows = last_is_pad & has_trans
+    mask[rows, last_trans[rows] + 1] = True
+    # no transition found (e.g. all-pad row): mark the first token
+    rows_nf = last_is_pad & ~has_trans
+    mask[rows_nf, 0] = True
     return mask
-
-
-def kl_div(x, is_log=True):
-    if is_log:
-        return torch.exp(x) - 1 - x
-    return x - 1 - torch.log(x)

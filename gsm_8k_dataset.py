@@ -114,7 +114,24 @@ def extract_ans(text):
         return ""
 
 
-def cal_reward(pred: str, gt: str):
+def cal_reward(pred: str, gt: str, strict: bool = False):
+    """Compute (format_r, content_r) for a generated sample.
+
+    strict=False (default, ppo/opd style): partial format credit (0.5 per section),
+        answer extracted from the whole prediction.
+    strict=True (grpo style): both "## Reasoning" and "## Answer" required, otherwise
+        (0, 0); answer extracted only from the text after "## Answer".
+    """
+    if strict:
+        if "## Reasoning" in pred and "## Answer" in pred:
+            format_r = 1.0
+        else:
+            return 0.0, 0.0
+        pred_ans = pred.split("## Answer")[-1]
+        extracted_ans = extract_ans(pred_ans)
+        # only for simple case, assume int answer
+        content_r = 1.0 if extracted_ans.strip() == gt.strip() else 0.0
+        return format_r, content_r
     format_r, answer_r = 0.0, 0.0
     if "## Reasoning" in pred:
         format_r += 0.5
